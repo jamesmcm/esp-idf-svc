@@ -16,6 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
 
+use futures::future::LocalBoxFuture; // TODO: Requires alloc
 use futures::FutureExt;
 use futures::TryFutureExt;
 
@@ -180,8 +181,7 @@ impl EspHttpConnection {
         method: Method,
         uri: &'a str,
         headers: &'a [(&'a str, &'a str)],
-    ) -> <EspHttpConnection as embedded_svc::http::client::asynch::Connection>::IntoRequestFuture<'_>
-    {
+    ) -> Result<(), EspError> {
         self.assert_initial();
 
         let c_uri = CString::new(uri).unwrap();
@@ -225,6 +225,7 @@ impl EspHttpConnection {
 
         self.request_content_len = content_len.unwrap_or(0);
 
+        // TODO: Make this async via on_event callback? But how to share with read + write ?
         esp!(unsafe { esp_http_client_open(self.raw_client, self.request_content_len as _) })?;
 
         self.state = State::Request;
@@ -236,13 +237,10 @@ impl EspHttpConnection {
         self.state == State::Request
     }
 
-    pub async fn initiate_response(
-        &mut self,
-    ) -> <EspHttpConnection as embedded_svc::http::client::asynch::Connection>::IntoResponseFuture<'_>
-    {
+    pub async fn initiate_response(&mut self) -> Result<(), EspError> {
         self.assert_request();
 
-        self.fetch_headers()?;
+        self.fetch_headers().await?;
 
         self.state = State::Response;
 
@@ -266,7 +264,9 @@ impl EspHttpConnection {
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EspError> {
         self.assert_response();
 
+        // TODO: Make this async - event handler?
         Self::check(unsafe {
+            // This is a helper API which internally calls esp_http_client_read multiple times till the end of data is reached or till the buffer gets full.
             esp_http_client_read_response(self.raw_client, buf.as_mut_ptr() as _, buf.len() as _)
         })
     }
@@ -274,6 +274,7 @@ impl EspHttpConnection {
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, EspError> {
         self.assert_request();
 
+        // TODO: Make this async - event handler?
         Self::check(unsafe {
             esp_http_client_write(self.raw_client, buf.as_ptr() as _, buf.len() as _)
         })
@@ -309,7 +310,7 @@ impl EspHttpConnection {
         }
     }
 
-    fn fetch_headers(&mut self) -> Result<(), EspError> {
+    async fn fetch_headers(&mut self) -> Result<(), EspError> {
         self.headers.clear();
         *self.content_len_header.get_mut() = None;
 
@@ -318,6 +319,7 @@ impl EspHttpConnection {
             let headers_ptr = &mut self.headers as *mut BTreeMap<Uncased, String>;
 
             let handler = move |event: &esp_http_client_event_t| {
+                dbg!(&event);
                 if event.event_id == esp_http_client_event_id_t_HTTP_EVENT_ON_HEADER {
                     unsafe {
                         // TODO: Replace with a proper conversion from ISO-8859-1 to UTF8
@@ -334,6 +336,8 @@ impl EspHttpConnection {
 
             self.register_handler(handler);
 
+            // This function need to call after esp_http_client_open, it will read from http stream, process all receive headers.
+            // TODO: Convert to async via Callback future? Is there an event for end of HTTP stream?
             let result = unsafe { esp_http_client_fetch_headers(self.raw_client) };
 
             self.deregister_handler();
@@ -439,29 +443,29 @@ impl Io for EspHttpConnection {
 }
 
 impl Read for EspHttpConnection {
-    type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<usize, Self::Error>>>>
+    type ReadFuture<'a> =  LocalBoxFuture<'a, Result<usize, Self::Error>>
     where
         Self: 'a;
 
     fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Self::ReadFuture<'a> {
-        EspHttpConnection::read(self, buf)
+        Box::pin(EspHttpConnection::read(self, buf).map_err(EspIOError))
     }
 }
 
 impl Write for EspHttpConnection {
-    type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<usize, Self::Error>>>>
+    type WriteFuture<'a> = LocalBoxFuture<'a, Result<usize, Self::Error>>
     where
         Self: 'a;
-    type FlushFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Self::Error>>>>
+    type FlushFuture<'a> = LocalBoxFuture<'a, Result<(), Self::Error>>
     where
         Self: 'a;
 
     fn write<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteFuture<'a> {
-        EspHttpConnection::write(self, buf)
+        Box::pin(EspHttpConnection::write(self, buf).map_err(EspIOError))
     }
 
-    fn flush<'a>(&'a mut self) -> Self::FlushFuture<'a> {
-        EspHttpConnection::flush(self).map_err(EspIOError)
+    fn flush<'a>(&'_ mut self) -> Self::FlushFuture<'_> {
+        Box::pin(EspHttpConnection::flush(self).map_err(EspIOError))
     }
 }
 
@@ -474,11 +478,11 @@ impl Connection for EspHttpConnection {
 
     type RawConnection = Self;
 
-    type IntoRequestFuture<'a> =  Pin<Box<dyn Future<Output = Result<(), Self::Error>>>>
+    type IntoRequestFuture<'a> =  LocalBoxFuture<'a, Result<(), Self::Error>>
         where
             Self: 'a;
 
-    type IntoResponseFuture<'a>  = Pin<Box<dyn Future<Output = Result<(), Self::Error>>>>
+    type IntoResponseFuture<'a>  = LocalBoxFuture<'a, Result<(), Self::Error>>
         where
             Self: 'a;
 
@@ -488,8 +492,10 @@ impl Connection for EspHttpConnection {
         uri: &'a str,
         headers: &'a [(&'a str, &'a str)],
     ) -> Self::IntoRequestFuture<'_> {
-        EspHttpConnection::initiate_request(self, method, uri, headers)
-            .map(|r| r.map_err(EspIOError))
+        Box::pin(
+            EspHttpConnection::initiate_request(self, method, uri, headers)
+                .map(|r| r.map_err(EspIOError)),
+        )
     }
 
     fn is_request_initiated(&self) -> bool {
@@ -497,7 +503,7 @@ impl Connection for EspHttpConnection {
     }
 
     fn initiate_response(&mut self) -> Self::IntoResponseFuture<'_> {
-        EspHttpConnection::initiate_response(self).map(|r| r.map_err(EspIOError))
+        Box::pin(EspHttpConnection::initiate_response(self).map(|r| r.map_err(EspIOError)))
     }
 
     fn is_response_initiated(&self) -> bool {

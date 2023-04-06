@@ -17,7 +17,7 @@ rust-version = "1.61"
 default = ["std"]
 
 std = ["alloc", "anyhow/std", "log/std", "esp-idf-sys/std", "esp-idf-hal/std", "embedded-svc/std"]
-alloc = ["anyhow", "esp-idf-hal/alloc", "embedded-svc/alloc"]
+alloc = ["anyhow", "esp-idf-hal/alloc", "embedded-svc/alloc", "futures/alloc"]
 nightly = ["embedded-svc/nightly"]
 experimental = ["embedded-svc/experimental"]
 embassy-time-driver = ["embassy-time"]
