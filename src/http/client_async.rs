@@ -37,6 +37,11 @@ use crate::private::common::Newtype;
 use crate::private::cstr::*;
 use crate::tls::X509;
 
+use std::{
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Waker},
+};
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "std", derive(Hash))]
 pub enum FollowRedirectsPolicy {
@@ -98,7 +103,8 @@ impl EspHttpConnection {
             use_global_ca_store: configuration.use_global_ca_store,
             #[cfg(not(esp_idf_version = "4.3"))]
             crt_bundle_attach: configuration.crt_bundle_attach,
-
+            is_async: true, // TODO: Test with multiple async requests
+            // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/protocols/esp_http_client.html#_CPPv423esp_http_client_perform24esp_http_client_handle_t
             ..Default::default()
         };
 
@@ -226,7 +232,29 @@ impl EspHttpConnection {
         self.request_content_len = content_len.unwrap_or(0);
 
         // TODO: Make this async via on_event callback? But how to share with read + write ?
-        esp!(unsafe { esp_http_client_open(self.raw_client, self.request_content_len as _) })?;
+        // TODO: Convert this to future - how do we poll async?
+
+        // This should be waker, ready on event 1
+        ClientFuture::new(self).await;
+        unsafe {
+            esp_http_client_open(self.raw_client, self.request_content_len as _);
+        }
+        // self.deregister_handler(); // TODO: This will destroy ALL handlers
+
+        // loop {
+        //     match esp!(unsafe {
+        //         esp_http_client_open(self.raw_client, self.request_content_len as _)
+        //     }) {
+        //         Err(e) => {
+        //             info!("Connection returned error: {:?}", e);
+        //             std::thread::sleep(std::time::Duration::from_millis(100));
+        //         }
+        //         Ok(t) => {
+        //             info!("Connection returned ok: {:?}", t);
+        //             break;
+        //         }
+        //     }
+        // }
 
         self.state = State::Request;
 
@@ -256,6 +284,7 @@ impl EspHttpConnection {
 
         let headers_ptr: *const EspHttpConnection = self as *const _;
 
+        // TODO - why not return &self.headers here?
         let headers = unsafe { headers_ptr.as_ref().unwrap() };
 
         (headers, self)
@@ -293,6 +322,7 @@ impl EspHttpConnection {
         }
     }
 
+    // TODO: Can this be used as async event bus?
     extern "C" fn on_events(event: *mut esp_http_client_event_t) -> esp_err_t {
         match unsafe { event.as_mut() } {
             Some(event) => {
@@ -319,7 +349,7 @@ impl EspHttpConnection {
             let headers_ptr = &mut self.headers as *mut BTreeMap<Uncased, String>;
 
             let handler = move |event: &esp_http_client_event_t| {
-                dbg!(&event);
+                info!("Received header event: {:?}", &event);
                 if event.event_id == esp_http_client_event_id_t_HTTP_EVENT_ON_HEADER {
                     unsafe {
                         // TODO: Replace with a proper conversion from ISO-8859-1 to UTF8
@@ -516,5 +546,62 @@ impl Connection for EspHttpConnection {
 
     fn raw_connection(&mut self) -> Result<&mut Self::RawConnection, Self::Error> {
         Err(EspError::from_infallible::<ESP_FAIL>().into())
+    }
+}
+
+pub struct ClientFuture {
+    shared_state: Arc<Mutex<SharedState>>,
+}
+
+/// Shared state between the future and the waiting thread
+struct SharedState {
+    completed: bool, // TODO: Add output for error handling
+    waker: Option<Waker>,
+}
+
+impl Future for ClientFuture {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut shared_state = self.shared_state.lock().unwrap();
+        if shared_state.completed {
+            Poll::Ready(())
+        } else {
+            shared_state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+impl ClientFuture {
+    pub fn new(client: &mut EspHttpConnection) -> Self {
+        let shared_state = Arc::new(Mutex::new(SharedState {
+            completed: false,
+            waker: None,
+        }));
+
+        // Spawn the new thread
+        let thread_shared_state = shared_state.clone();
+
+        let handler = move |event: &esp_http_client_event_t| {
+            info!("Received client future event: {:?}", &event);
+
+            let mut inner_shared_state = thread_shared_state.lock().unwrap();
+            if event.event_id == 1 {
+                inner_shared_state.completed = true;
+            }
+
+            if let Some(waker) = inner_shared_state.waker.take() {
+                waker.wake()
+            }
+            ESP_OK as esp_err_t
+        };
+
+        client.register_handler(handler); // TODO: This overwrites any handler in the client - how to manage shared client? Event bus?
+
+        // If error then pending, if Ok then ready
+        unsafe {
+            esp_http_client_open(client.raw_client, client.request_content_len as _);
+        }
+
+        ClientFuture { shared_state }
     }
 }
